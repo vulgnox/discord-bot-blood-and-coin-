@@ -307,7 +307,165 @@ async def legend(interaction: discord.Interaction, moment: str):
         await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="duel", description="Challenge another player to a duel (costs 50 Coin, winner takes all)")
+# Move counter system: Attack > Trick > Defend > Attack
+MOVE_COUNTERS = {"Attack": "Trick", "Trick": "Defend", "Defend": "Attack"}
+MOVE_EMOJIS = {"Attack": "⚔️", "Defend": "🛡️", "Trick": "🎭"}
+
+# Pending duels: {challenger_id: {opponent_id, challenger_move, challenger_name, defender_name, coin_stake, channel_id}}
+pending_duels: dict = {}
+
+class DuelMoveView(discord.ui.View):
+    def __init__(self, duel_key: str):
+        super().__init__(timeout=60)
+        self.duel_key = duel_key
+
+    async def resolve_duel(self, interaction: discord.Interaction, defender_move: str):
+        duel = pending_duels.pop(self.duel_key, None)
+        if not duel:
+            await interaction.response.send_message("This duel already ended.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        challenger_move = duel["challenger_move"]
+        c_name = duel["challenger_name"]
+        d_name = duel["defender_name"]
+
+        # Determine move winner (60% weight)
+        # Attack beats Trick, Trick beats Defend, Defend beats Attack
+        if MOVE_COUNTERS[challenger_move] == defender_move:
+            move_advantage = "challenger"   # challenger's move beats defender's
+        elif MOVE_COUNTERS[defender_move] == challenger_move:
+            move_advantage = "defender"     # defender's move beats challenger's
+        else:
+            move_advantage = "tie"
+
+        # Blood advantage (40% weight)
+        data = load_data()
+        challenger = get_player(data, duel["challenger_id"], c_name)
+        defender = get_player(data, str(interaction.user.id), interaction.user.display_name)
+
+        c_blood = challenger["blood"]
+        d_blood = defender["blood"]
+        total_blood = c_blood + d_blood or 1
+
+        # Score: move result 60pts + blood ratio 40pts
+        c_score = (60 if move_advantage == "challenger" else 0 if move_advantage == "defender" else 30) + int((c_blood / total_blood) * 40)
+        d_score = (60 if move_advantage == "defender" else 0 if move_advantage == "challenger" else 30) + int((d_blood / total_blood) * 40)
+
+        challenger_wins = c_score >= d_score
+
+        # AI narration
+        system = (
+            "You are a fantasy battle narrator for a Discord RP server. "
+            "Two characters dueled using specific moves. Write a dramatic 3-sentence battle description "
+            "that reflects the moves they chose and who won. No emojis. End with: 'Winner: [name]'."
+        )
+        prompt = (
+            f"Challenger: {c_name} (Blood: {c_blood}, Move: {challenger_move})\n"
+            f"Defender: {d_name} (Blood: {d_blood}, Move: {defender_move})\n"
+            f"Winner: {c_name if challenger_wins else d_name}\n"
+            f"Describe the fight based on their moves and declare the winner."
+        )
+        narrative = await ask_ai(system, prompt)
+
+        stake = duel["coin_stake"]
+        if challenger_wins:
+            challenger["coin"] += stake
+            defender["coin"] = max(0, defender["coin"] - stake)
+            challenger["blood"] += 20
+            winner_mention = f"<@{duel['challenger_id']}>"
+            winner_name = c_name
+        else:
+            defender["coin"] += stake
+            challenger["coin"] = max(0, challenger["coin"] - stake)
+            defender["blood"] += 20
+            winner_mention = interaction.user.mention
+            winner_name = d_name
+
+        save_data(data)
+
+        move_summary = (
+            f"{MOVE_EMOJIS[challenger_move]} **{c_name}** used **{challenger_move}**\n"
+            f"{MOVE_EMOJIS[defender_move]} **{d_name}** used **{defender_move}**\n"
+        )
+        score_line = f"Score: {c_name} {c_score}pts vs {d_name} {d_score}pts"
+
+        channel = interaction.channel
+        await channel.send(
+            f"⚔️ **DUEL RESOLVED**\n<@{duel['challenger_id']}> vs {interaction.user.mention}\n\n"
+            f"{move_summary}\n"
+            f"*{narrative}*\n\n"
+            f"`{score_line}`\n"
+            f"🏆 {winner_mention} wins **{stake} Coin**!"
+        )
+        await refresh_leaderboard(interaction.guild, data)
+        self.stop()
+
+    @discord.ui.button(label="⚔️ Attack", style=discord.ButtonStyle.danger)
+    async def attack(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.resolve_duel(interaction, "Attack")
+
+    @discord.ui.button(label="🛡️ Defend", style=discord.ButtonStyle.primary)
+    async def defend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.resolve_duel(interaction, "Defend")
+
+    @discord.ui.button(label="🎭 Trick", style=discord.ButtonStyle.secondary)
+    async def trick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.resolve_duel(interaction, "Trick")
+
+    async def on_timeout(self):
+        duel = pending_duels.pop(list(pending_duels.keys())[0] if pending_duels else "", None)
+
+
+class ChallengerMoveView(discord.ui.View):
+    def __init__(self, opponent: discord.Member, stake: int):
+        super().__init__(timeout=60)
+        self.opponent = opponent
+        self.stake = stake
+
+    async def pick_move(self, interaction: discord.Interaction, move: str):
+        data = load_data()
+        challenger = get_player(data, str(interaction.user.id), interaction.user.display_name)
+        defender = get_player(data, str(self.opponent.id), self.opponent.display_name)
+
+        duel_key = f"{interaction.user.id}-{self.opponent.id}"
+        pending_duels[duel_key] = {
+            "challenger_id": str(interaction.user.id),
+            "challenger_move": move,
+            "challenger_name": challenger.get("character") or interaction.user.display_name,
+            "defender_name": defender.get("character") or self.opponent.display_name,
+            "coin_stake": self.stake,
+            "channel_id": interaction.channel_id,
+        }
+
+        view = DuelMoveView(duel_key)
+        await interaction.response.send_message(
+            f"⚔️ **{challenger.get('character') or interaction.user.display_name}** challenges "
+            f"**{defender.get('character') or self.opponent.display_name}** to a duel!\n\n"
+            f"Stake: **{self.stake} Coin** • {MOVE_EMOJIS[move]} Challenger locked in **{move}**\n\n"
+            f"{self.opponent.mention} — pick your move! You have **60 seconds.**",
+            view=view
+        )
+        self.stop()
+
+    @discord.ui.button(label="⚔️ Attack", style=discord.ButtonStyle.danger)
+    async def attack(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.pick_move(interaction, "Attack")
+
+    @discord.ui.button(label="🛡️ Defend", style=discord.ButtonStyle.primary)
+    async def defend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.pick_move(interaction, "Defend")
+
+    @discord.ui.button(label="🎭 Trick", style=discord.ButtonStyle.secondary)
+    async def trick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.pick_move(interaction, "Trick")
+
+    async def on_timeout(self):
+        pass
+
+
+@tree.command(name="duel", description="Challenge someone to a skill duel (costs 50 Coin, winner takes all)")
 @app_commands.describe(opponent="Who to challenge")
 async def duel(interaction: discord.Interaction, opponent: discord.Member):
     if opponent.id == interaction.user.id:
@@ -316,51 +474,21 @@ async def duel(interaction: discord.Interaction, opponent: discord.Member):
 
     data = load_data()
     challenger = get_player(data, str(interaction.user.id), interaction.user.display_name)
-    defender = get_player(data, str(opponent.id), opponent.display_name)
 
-    if challenger["coin"] < 50:
-        await interaction.response.send_message("You need at least 50 Coin to issue a duel.", ephemeral=True)
+    if not challenger.get("character"):
+        await interaction.response.send_message("You need to `/join` first.", ephemeral=True)
         return
 
-    await interaction.response.defer()
+    if challenger["coin"] < 50:
+        await interaction.response.send_message("You need at least 50 Coin to duel.", ephemeral=True)
+        return
 
-    system = (
-        "You are a fantasy battle narrator for a Discord RP server. "
-        "Two characters are dueling. Write a short, dramatic 3-sentence battle description. "
-        "Pick a winner (slightly favour the challenger). End with: 'Winner: [name]'. No emojis."
+    view = ChallengerMoveView(opponent, stake=50)
+    await interaction.response.send_message(
+        f"**{challenger.get('character')}**, pick your move secretly — opponent can't see this yet!",
+        view=view,
+        ephemeral=True
     )
-    prompt = (
-        f"Challenger: {challenger.get('character') or interaction.user.display_name} "
-        f"(faction: {challenger.get('faction') or 'unknown'}, Blood: {challenger['blood']})\n"
-        f"Defender: {defender.get('character') or opponent.display_name} "
-        f"(faction: {defender.get('faction') or 'unknown'}, Blood: {defender['blood']})"
-    )
-    narrative = await ask_ai(system, prompt)
-
-    # Parse winner from narrative
-    challenger_name = challenger.get("character") or interaction.user.display_name
-    defender_name = defender.get("character") or opponent.display_name
-    challenger_wins = challenger_name.lower() in narrative.lower().split("winner:")[-1].lower()
-
-    if challenger_wins:
-        challenger["coin"] += 50
-        defender["coin"] = max(0, defender["coin"] - 50)
-        challenger["blood"] += 20
-        winner_mention = interaction.user.mention
-    else:
-        defender["coin"] += 50
-        challenger["coin"] = max(0, challenger["coin"] - 50)
-        defender["blood"] += 20
-        winner_mention = opponent.mention
-
-    save_data(data)
-
-    await interaction.followup.send(
-        f"⚔️ **DUEL**\n{interaction.user.mention} vs {opponent.mention}\n\n"
-        f"*{narrative}*\n\n"
-        f"🏆 {winner_mention} wins **50 Coin**!"
-    )
-    await refresh_leaderboard(interaction.guild, data)
 
 
 @tree.command(name="forcepost", description="[Admin] Post today's decree now")
