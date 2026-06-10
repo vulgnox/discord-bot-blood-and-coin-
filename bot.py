@@ -443,7 +443,7 @@ class ChallengerMoveView(discord.ui.View):
         await interaction.response.send_message(
             f"⚔️ **{challenger.get('character') or interaction.user.display_name}** challenges "
             f"**{defender.get('character') or self.opponent.display_name}** to a duel!\n\n"
-            f"Stake: **{self.stake} Coin** • {MOVE_EMOJIS[move]} Challenger locked in **{move}**\n\n"
+            f"Stake: **{self.stake} Coin** • 🔒 Challenger's move is sealed\n\n"
             f"{self.opponent.mention} — pick your move! You have **60 seconds.**",
             view=view
         )
