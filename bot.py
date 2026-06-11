@@ -33,17 +33,17 @@ async def init_db():
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS players (
-                uid             TEXT PRIMARY KEY,
-                username        TEXT,
-                coin            INTEGER DEFAULT 100,
-                blood           INTEGER DEFAULT 0,
-                faction         TEXT,
-                character       TEXT,
+                uid              TEXT PRIMARY KEY,
+                username         TEXT,
+                coin             INTEGER DEFAULT 100,
+                blood            INTEGER DEFAULT 0,
+                faction          TEXT,
+                character        TEXT,
                 decree_responded BOOLEAN DEFAULT FALSE,
-                steal_cooldown  TEXT,
-                gamble_cooldown TEXT,
-                duel_wins       INTEGER DEFAULT 0,
-                duel_losses     INTEGER DEFAULT 0
+                steal_cooldown   TEXT,
+                gamble_cooldown  TEXT,
+                duel_wins        INTEGER DEFAULT 0,
+                duel_losses      INTEGER DEFAULT 0
             )
         """)
         await conn.execute("""
@@ -52,7 +52,31 @@ async def init_db():
                 value TEXT
             )
         """)
-        # Seed meta defaults if not present
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS quests (
+                id            SERIAL PRIMARY KEY,
+                owner_uid     TEXT,
+                title         TEXT NOT NULL,
+                stages        JSONB NOT NULL,
+                current_stage INTEGER NOT NULL DEFAULT 0,
+                reward        INTEGER NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'active',
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at    TIMESTAMPTZ NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS contracts (
+                id           SERIAL PRIMARY KEY,
+                name         TEXT NOT NULL,
+                difficulty   INTEGER NOT NULL,
+                reward_coin  INTEGER NOT NULL,
+                reward_blood INTEGER NOT NULL,
+                metadata     JSONB,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at   TIMESTAMPTZ NULL
+            )
+        """)
         defaults = {
             "decree":             "null",
             "leaderboard_msg_id": "null",
@@ -66,32 +90,6 @@ async def init_db():
                 "INSERT INTO meta (key, value) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                 k, v
             )
-        # Ensure quests and contracts tables exist (runtime safety)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS quests (
-                id SERIAL PRIMARY KEY,
-                owner_uid TEXT,
-                title TEXT NOT NULL,
-                stages JSONB NOT NULL,
-                current_stage INTEGER NOT NULL DEFAULT 0,
-                reward INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                expires_at TIMESTAMPTZ NULL
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS contracts (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                difficulty INTEGER NOT NULL,
-                reward_coin INTEGER NOT NULL,
-                reward_blood INTEGER NOT NULL,
-                metadata JSONB,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                expires_at TIMESTAMPTZ NULL
-            )
-        """)
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
@@ -168,7 +166,7 @@ async def get_or_create_player(uid: str, username: str) -> dict:
     return p
 
 
-# ── Quest & Contract DB helpers ───────────────────────────────────────────────
+# ── Quest DB helpers ──────────────────────────────────────────────────────────
 async def create_quest_db(owner_uid: str | None, title: str, stages: list, reward: int, expires_at: str | None = None) -> int:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -179,13 +177,10 @@ async def create_quest_db(owner_uid: str | None, title: str, stages: list, rewar
 
 async def fetch_active_quest_by_owner(owner_uid: str) -> dict | None:
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM quests WHERE owner_uid=$1 AND status='active'", owner_uid)
+        row = await conn.fetchrow(
+            "SELECT * FROM quests WHERE owner_uid=$1 AND status='active'", owner_uid
+        )
     return dict(row) if row else None
-
-async def fetch_active_board_quests(limit: int = 10) -> list[dict]:
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM quests WHERE owner_uid IS NULL AND status='active' ORDER BY created_at DESC LIMIT $1", limit)
-    return [dict(r) for r in rows]
 
 async def update_quest_stage_db(quest_id: int, new_stage: int) -> None:
     async with db_pool.acquire() as conn:
@@ -195,11 +190,34 @@ async def complete_quest_db(quest_id: int) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE quests SET status='completed' WHERE id=$1", quest_id)
 
+async def load_active_quests_from_db() -> None:
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM quests WHERE status='active' AND owner_uid IS NOT NULL"
+            )
+        for r in rows:
+            stages = r["stages"]
+            if isinstance(stages, str):
+                stages = json.loads(stages)
+            active_quests[r["owner_uid"]] = {
+                "id":     r["id"],
+                "title":  r["title"],
+                "stages": stages,
+                "stage":  r["current_stage"],
+                "reward": r["reward"],
+            }
+    except Exception:
+        pass
 
-async def create_contract_db(name: str, difficulty: int, reward_coin: int, reward_blood: int, metadata: dict | None = None, expires_at: str | None = None) -> int:
+
+# ── Contract DB helpers ───────────────────────────────────────────────────────
+async def create_contract_db(name: str, difficulty: int, reward_coin: int, reward_blood: int,
+                              metadata: dict | None = None, expires_at: str | None = None) -> int:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "INSERT INTO contracts (name, difficulty, reward_coin, reward_blood, metadata, expires_at) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+            "INSERT INTO contracts (name, difficulty, reward_coin, reward_blood, metadata, expires_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
             name, difficulty, reward_coin, reward_blood, json.dumps(metadata or {}), expires_at
         )
     return row["id"]
@@ -209,100 +227,18 @@ async def fetch_contract_by_id(contract_id: int) -> dict | None:
         row = await conn.fetchrow("SELECT * FROM contracts WHERE id=$1", contract_id)
     return dict(row) if row else None
 
-async def load_active_quests_from_db() -> None:
-    """Load active personal quests into in-memory cache on startup (optional)."""
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM quests WHERE status='active' AND owner_uid IS NOT NULL")
-        for r in rows:
-            active_quests[r["owner_uid"]] = {
-                "id": r["id"],
-                "title": r["title"],
-                "stages": r["stages"],
-                "stage": r["current_stage"],
-                "reward": r["reward"],
-            }
-    except Exception:
-        # tolerate errors at startup — DB may be unavailable during migrations
-        pass
-
-
-# ── Contracts helpers & commands ─────────────────────────────────────────────
 async def fetch_active_contracts(limit: int = 10) -> list[dict]:
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM contracts WHERE expires_at IS NULL OR expires_at > now() ORDER BY created_at DESC LIMIT $1", limit)
+        rows = await conn.fetch(
+            "SELECT * FROM contracts WHERE expires_at IS NULL OR expires_at > now() "
+            "ORDER BY created_at DESC LIMIT $1",
+            limit
+        )
     return [dict(r) for r in rows]
 
 async def expire_contract_db(contract_id: int) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE contracts SET expires_at = now() WHERE id=$1", contract_id)
-
-
-@tree.command(name="contracts", description="List available Shadow Contracts")
-async def list_contracts(interaction: discord.Interaction):
-    await interaction.response.defer()
-    rows = await fetch_active_contracts()
-    if not rows:
-        await interaction.followup.send("No active contracts right now.")
-        return
-    lines = ["## 🪓 Shadow Contracts — Available" ]
-    for r in rows:
-        lines.append(f"**ID {r['id']}** — {r['name']}  (Difficulty {r['difficulty']})\n  Reward: {r['reward_coin']} Coin, {r['reward_blood']} Blood")
-    await interaction.followup.send("\n".join(lines))
-
-
-@tree.command(name="addcontract", description="[Admin] Create a Shadow Contract")
-@app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(name="Contract name", difficulty="1-5", reward_coin="Coin reward", reward_blood="Blood reward", expires_hours="Optional expiry in hours")
-async def add_contract(interaction: discord.Interaction, name: str, difficulty: int, reward_coin: int, reward_blood: int, expires_hours: int = None):
-    if difficulty < 1 or difficulty > 10:
-        await interaction.response.send_message("Difficulty must be between 1 and 10.", ephemeral=True)
-        return
-    expires = None
-    if expires_hours:
-        expires = (datetime.utcnow() + timedelta(hours=expires_hours)).isoformat()
-    cid = await create_contract_db(name, difficulty, reward_coin, reward_blood, {}, expires)
-    await interaction.response.send_message(f"Contract created (ID {cid}).", ephemeral=True)
-
-
-@tree.command(name="acceptcontract", description="Accept and attempt a Shadow Contract")
-@app_commands.describe(contract_id="ID of the contract to accept")
-async def accept_contract(interaction: discord.Interaction, contract_id: int):
-    uid = str(interaction.user.id)
-    player = await get_or_create_player(uid, interaction.user.display_name)
-    if not is_registered(player):
-        await interaction.response.send_message("Use `/join` first.", ephemeral=True)
-        return
-    contract = await fetch_contract_by_id(contract_id)
-    if not contract or (contract.get('expires_at') and datetime.fromisoformat(contract['expires_at']) <= datetime.utcnow()):
-        await interaction.response.send_message("Contract not found or expired.", ephemeral=True)
-        return
-
-    # Compute success chance: base 50% modified by difficulty and player's blood
-    base = 50
-    diff_penalty = int(contract['difficulty']) * 6  # bigger difficulty reduces chance
-    blood_bonus = min(30, player.get('blood', 0) // 5)
-    success_chance = max(10, base - diff_penalty + blood_bonus)
-
-    roll = random.randint(1, 100)
-    await interaction.response.defer()
-    if roll <= success_chance:
-        # success
-        player['coin'] += int(contract['reward_coin'])
-        player['blood'] += int(contract['reward_blood'])
-        await upsert_player(uid, player)
-        await add_faction_score(player.get('faction'), 10)
-        await expire_contract_db(contract_id)
-        await interaction.followup.send(f"✅ Success! You completed **{contract['name']}**. Rewards: +{contract['reward_coin']} Coin, +{contract['reward_blood']} Blood")
-        await refresh_leaderboard(interaction.guild)
-    else:
-        # failure penalty
-        loss = min(player.get('coin', 0), max(1, int(contract['reward_coin']) // 3))
-        player['coin'] = max(0, player.get('coin', 0) - loss)
-        player['blood'] = max(0, player.get('blood', 0) - max(0, int(contract['reward_blood']) // 4))
-        await upsert_player(uid, player)
-        await expire_contract_db(contract_id)
-        await interaction.followup.send(f"💀 You failed **{contract['name']}**. You lost {loss} Coin and some Blood.")
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -365,7 +301,7 @@ async def ask_ai(system: str, user: str, max_tokens: int = 400) -> str:
         raise AIError(f"AI request failed: {e}") from e
 
 
-# ── Bot setup ──────────────────────────────────────────────────────────────────
+# ── Bot + tree setup  (must come before any @tree.command) ────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -414,74 +350,6 @@ async def refresh_leaderboard(guild: discord.Guild) -> None:
         pass
     msg = await ch.send(content)
     await set_meta("leaderboard_msg_id", str(msg.id))
-
-
-# ── Daily Decree ───────────────────────────────────────────────────────────────
-async def generate_decree() -> str:
-    players = await load_all_players()
-    factions = list({p["faction"] for p in players.values() if p.get("faction")}) or FACTIONS
-    return await ask_ai(
-        "You are the herald of Valdris, a gritty fantasy city. Write dramatic Daily Decrees. "
-        "Each decree: 3-5 sentences, a dramatic situation + what members must DO + deadline flavour. "
-        "Tone: dark, immersive, high stakes. No emojis. Under 120 words.",
-        f"Active factions: {', '.join(factions)}. Write today's Daily Decree."
-    )
-
-@tasks.loop(time=time(hour=DECREE_HOUR, tzinfo=pytz.timezone(TIMEZONE)))
-async def daily_decree_task():
-    for guild in bot.guilds:
-        await post_decree(guild)
-
-async def post_decree(guild: discord.Guild) -> None:
-    ch = discord.utils.get(guild.text_channels, name=DECREE_CHANNEL)
-    if not ch:
-        return
-    # Reset all players' decree_responded
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE players SET decree_responded=FALSE")
-    text = await generate_decree()
-    await set_meta("decree", {"text": text, "date": str(datetime.utcnow().date())})
-    embed = discord.Embed(title="📜 The Daily Decree", description=text, color=0x8B1A1A)
-    embed.set_footer(text="Use /decree respond <your action> before midnight to earn 50 Coin")
-    await ch.send(embed=embed)
-
-
-# ── Weekly Faction War ─────────────────────────────────────────────────────────
-@tasks.loop(time=time(hour=9, tzinfo=pytz.timezone(TIMEZONE)))
-async def weekly_faction_task():
-    now = datetime.now(pytz.timezone(TIMEZONE))
-    if now.weekday() == 0:
-        for guild in bot.guilds:
-            await resolve_faction_war(guild)
-
-async def resolve_faction_war(guild: discord.Guild) -> None:
-    scores = await get_meta("faction_scores") or {}
-    if not any(scores.values()):
-        return
-
-    winner = max(scores, key=lambda f: scores[f])
-    bonus  = 200
-    players = await load_all_players()
-    winners = []
-
-    for uid, p in players.items():
-        if is_registered(p) and p["faction"] == winner:
-            p["coin"] += bonus
-            await upsert_player(uid, p)
-            winners.append(cname(p))
-
-    await set_meta("faction_scores", {f: 0 for f in FACTIONS})
-    await set_meta("faction_week_start", str(datetime.utcnow().date()))
-
-    ch = discord.utils.get(guild.text_channels, name=LEADERBOARD_CHANNEL)
-    if ch and winners:
-        names = ", ".join(f"**{n}**" for n in winners)
-        await ch.send(
-            f"## ⚔️ FACTION WAR RESULTS\n"
-            f"**{winner}** dominated this week and each member earns **{bonus} Coin**!\n"
-            f"Champions: {names}\n\n*New week begins now. Fight for your faction.*"
-        )
-    await refresh_leaderboard(guild)
 
 
 # ── Duel system ───────────────────────────────────────────────────────────────
@@ -671,7 +539,7 @@ class ChallengerMoveView(discord.ui.View):
         pass
 
 
-# ── Quest system ───────────────────────────────────────────────────────────────
+# ── Quest generation helpers ───────────────────────────────────────────────────
 async def generate_quest(character: str, faction: str) -> dict:
     system = (
         "You are a quest designer for a gritty fantasy Discord RP set in Valdris. "
@@ -727,18 +595,15 @@ async def join(interaction: discord.Interaction,
                character_name: str, faction: app_commands.Choice[str]):
     uid    = str(interaction.user.id)
     player = await get_or_create_player(uid, interaction.user.display_name)
-
     if is_registered(player):
         await interaction.response.send_message(
             f"You're already **{player['character']}** of **{player['faction']}**. "
             "Use `/profile` to check your stats.", ephemeral=True
         )
         return
-
     player["character"] = character_name.strip()
     player["faction"]   = faction.value
     await upsert_player(uid, player)
-
     decree_ch = discord.utils.get(interaction.guild.text_channels, name=DECREE_CHANNEL)
     await interaction.response.send_message(
         f"⚔️ **{character_name}** has entered Valdris, sworn to **{faction.value}**.\n"
@@ -752,11 +617,9 @@ async def join(interaction: discord.Interaction,
 async def profile(interaction: discord.Interaction):
     uid    = str(interaction.user.id)
     player = await get_or_create_player(uid, interaction.user.display_name)
-
     if not is_registered(player):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
-
     all_players = await load_all_players()
     ranked = sorted(
         [(u, p) for u, p in all_players.items() if is_registered(p)],
@@ -765,12 +628,11 @@ async def profile(interaction: discord.Interaction):
     rank     = next((i+1 for i, (u, _) in enumerate(ranked) if u == uid), "?")
     bounties = await get_meta("bounties") or {}
     bounty   = bounties.get(uid)
-
     embed = discord.Embed(title=f"⚔️ {player['character']}", color=0x4B0082)
-    embed.add_field(name="Faction",  value=player["faction"],   inline=True)
-    embed.add_field(name="Rank",     value=f"#{rank}",          inline=True)
-    embed.add_field(name="💰 Coin",  value=str(player["coin"]), inline=True)
-    embed.add_field(name="🩸 Blood", value=str(player["blood"]),inline=True)
+    embed.add_field(name="Faction",  value=player["faction"],    inline=True)
+    embed.add_field(name="Rank",     value=f"#{rank}",           inline=True)
+    embed.add_field(name="💰 Coin",  value=str(player["coin"]),  inline=True)
+    embed.add_field(name="🩸 Blood", value=str(player["blood"]), inline=True)
     embed.add_field(name="Duel W/L", value=f"{player.get('duel_wins',0)}/{player.get('duel_losses',0)}", inline=True)
     if bounty:
         embed.set_footer(text=f"🎯 Bounty on your head: {bounty['amount']} Coin")
@@ -782,7 +644,6 @@ async def profile(interaction: discord.Interaction):
 async def decree_respond(interaction: discord.Interaction, action: str):
     uid    = str(interaction.user.id)
     player = await get_or_create_player(uid, interaction.user.display_name)
-
     if not is_registered(player):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
@@ -793,7 +654,6 @@ async def decree_respond(interaction: discord.Interaction, action: str):
     if not decree:
         await interaction.response.send_message("No decree posted yet today.", ephemeral=True)
         return
-
     await interaction.response.defer()
     try:
         outcome = await ask_ai(
@@ -803,13 +663,11 @@ async def decree_respond(interaction: discord.Interaction, action: str):
         )
     except AIError:
         outcome = f"{player['character']} answered the call and made their mark on the city."
-
     player["coin"]  += 50
     player["blood"] += 10
     player["decree_responded"] = True
     await upsert_player(uid, player)
     await add_faction_score(player.get("faction"), 5)
-
     await interaction.followup.send(
         f"*{outcome}*\n\n**{player['character']}** earns **+50 Coin** and **+10 Blood**. 💰🩸"
     )
@@ -825,17 +683,15 @@ async def duel(interaction: discord.Interaction, opponent: discord.Member):
     if opponent.bot:
         await interaction.response.send_message("Can't duel a bot.", ephemeral=True)
         return
-
     uid        = str(interaction.user.id)
     challenger = await get_or_create_player(uid, interaction.user.display_name)
     defender   = await get_or_create_player(str(opponent.id), opponent.display_name)
-
     if not is_registered(challenger):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
     if not is_registered(defender):
         await interaction.response.send_message(
-            f"**{opponent.display_name}** hasn't joined yet. They need `/join` first.", ephemeral=True
+            f"**{opponent.display_name}** hasn't joined yet.", ephemeral=True
         )
         return
     if challenger["coin"] < 50:
@@ -845,13 +701,12 @@ async def duel(interaction: discord.Interaction, opponent: discord.Member):
         return
     if defender["coin"] < 50:
         await interaction.response.send_message(
-            f"**{defender['character']}** is too broke to duel (needs 50 Coin).", ephemeral=True
+            f"**{cname(defender)}** is too broke to duel (needs 50 Coin).", ephemeral=True
         )
         return
-
     view = ChallengerMoveView(interaction.user.id, opponent, stake=50)
     await interaction.response.send_message(
-        f"🔒 **{challenger['character']}**, pick your move — only you can see this!",
+        f"🔒 **{cname(challenger)}**, pick your move — only you can see this!",
         view=view, ephemeral=True
     )
 
@@ -862,11 +717,9 @@ async def steal(interaction: discord.Interaction, target: discord.Member):
     if target.id == interaction.user.id:
         await interaction.response.send_message("Can't rob yourself.", ephemeral=True)
         return
-
     uid    = str(interaction.user.id)
     thief  = await get_or_create_player(uid, interaction.user.display_name)
     victim = await get_or_create_player(str(target.id), target.display_name)
-
     if not is_registered(thief):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
@@ -878,23 +731,20 @@ async def steal(interaction: discord.Interaction, target: discord.Member):
     if on_cooldown(thief.get("steal_cooldown"), 30):
         left = cooldown_left(thief["steal_cooldown"], 30)
         await interaction.response.send_message(
-            f"You need to lay low for **{left}** before stealing again.", ephemeral=True
+            f"Lay low for **{left}** before stealing again.", ephemeral=True
         )
         return
     if victim["coin"] < 20:
         await interaction.response.send_message(
-            f"**{victim['character']}** has barely anything worth stealing.", ephemeral=True
+            f"**{cname(victim)}** has barely anything worth stealing.", ephemeral=True
         )
         return
-
     await interaction.response.defer()
     thief["steal_cooldown"] = datetime.utcnow().isoformat()
-
     blood_diff  = thief["blood"] - victim["blood"]
     success_pct = max(30, min(70, 50 + blood_diff // 5))
     success     = random.randint(1, 100) <= success_pct
     steal_amount = max(10, int(victim["coin"] * random.uniform(0.10, 0.30)))
-
     if success:
         steal_amount   = min(steal_amount, victim["coin"])
         thief["coin"]  += steal_amount
@@ -912,18 +762,15 @@ async def steal(interaction: discord.Interaction, target: discord.Member):
             f"{cname(thief)} tried to rob {cname(victim)} but got caught. Lost {penalty} Coin. "
             "Write 2 cinematic sentences about getting caught. No emojis."
         )
-
     await upsert_player(uid, thief)
     await upsert_player(str(target.id), victim)
-
     try:
         narrative = await ask_ai(
             "You are a gritty fantasy narrator for a Discord RP. Be dramatic and brief.",
             outcome_prompt
         )
     except AIError:
-        narrative = "The streets of Valdris never forget what happened next." if success else "The guards were watching. A costly mistake."
-
+        narrative = "The streets of Valdris never forget." if success else "The guards were watching."
     if success:
         await interaction.followup.send(
             f"🔪 **HEIST**\n\n*{narrative}*\n\n"
@@ -945,10 +792,8 @@ async def gamble(interaction: discord.Interaction, amount: int):
     if amount <= 0:
         await interaction.response.send_message("Bet must be positive.", ephemeral=True)
         return
-
     uid    = str(interaction.user.id)
     player = await get_or_create_player(uid, interaction.user.display_name)
-
     if not is_registered(player):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
@@ -963,14 +808,11 @@ async def gamble(interaction: discord.Interaction, amount: int):
             f"Not enough Coin. You have **{player['coin']}**.", ephemeral=True
         )
         return
-
     await interaction.response.defer()
     player["gamble_cooldown"] = datetime.utcnow().isoformat()
-
     roll    = random.randint(1, 100)
     win_pct = 45
     won     = roll <= win_pct
-
     if won:
         multiplier = random.choice([1.5, 2.0, 2.5])
         winnings   = int(amount * multiplier) - amount
@@ -981,9 +823,7 @@ async def gamble(interaction: discord.Interaction, amount: int):
         player["coin"] -= amount
         result_line = f"**-{amount} Coin**"
         colour      = 0xFF0000
-
     await upsert_player(uid, player)
-
     try:
         narrative = await ask_ai(
             "You are narrating a tense gambling scene in a gritty fantasy tavern called The Rusty Crown. "
@@ -992,15 +832,14 @@ async def gamble(interaction: discord.Interaction, amount: int):
         )
     except AIError:
         narrative = "The dice rolled. Fate decided."
-
     embed = discord.Embed(
         title=f"🎰 {'WINNER!' if won else 'BUST!'}",
         description=f"*{narrative}*",
         color=colour
     )
-    embed.add_field(name="Bet",     value=f"{amount} Coin",         inline=True)
-    embed.add_field(name="Result",  value=result_line,               inline=True)
-    embed.add_field(name="Balance", value=f"{player['coin']} Coin",  inline=True)
+    embed.add_field(name="Bet",     value=f"{amount} Coin",        inline=True)
+    embed.add_field(name="Result",  value=result_line,              inline=True)
+    embed.add_field(name="Balance", value=f"{player['coin']} Coin", inline=True)
     embed.set_footer(text=f"Roll: {roll}/100  |  Win chance: {win_pct}%")
     await interaction.followup.send(embed=embed)
     await refresh_leaderboard(interaction.guild)
@@ -1015,11 +854,9 @@ async def bounty(interaction: discord.Interaction, target: discord.Member, amoun
     if amount < 50:
         await interaction.response.send_message("Minimum bounty is 50 Coin.", ephemeral=True)
         return
-
     uid    = str(interaction.user.id)
     placer = await get_or_create_player(uid, interaction.user.display_name)
     victim = await get_or_create_player(str(target.id), target.display_name)
-
     if not is_registered(placer):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
@@ -1033,7 +870,6 @@ async def bounty(interaction: discord.Interaction, target: discord.Member, amoun
             f"Not enough Coin. You have **{placer['coin']}**.", ephemeral=True
         )
         return
-
     bounties  = await get_meta("bounties") or {}
     existing  = bounties.get(str(target.id), {})
     new_total = existing.get("amount", 0) + amount
@@ -1045,7 +881,6 @@ async def bounty(interaction: discord.Interaction, target: discord.Member, amoun
         "placed_by_name": cname(placer),
     }
     await set_meta("bounties", bounties)
-
     await interaction.response.send_message(
         f"🎯 **BOUNTY PLACED**\n\n"
         f"**{cname(placer)}** puts **{amount} Coin** on **{cname(victim)}'s** head.\n"
@@ -1062,7 +897,7 @@ async def bounties_list(interaction: discord.Interaction):
     if not active:
         await interaction.response.send_message("No active bounties.", ephemeral=True)
         return
-    lines = ["## 🎯 Active Bounties\n"]
+    lines   = ["## 🎯 Active Bounties\n"]
     players = await load_all_players()
     for uid, b in sorted(active.items(), key=lambda x: -x[1]["amount"]):
         p    = players.get(uid, {})
@@ -1075,18 +910,16 @@ async def bounties_list(interaction: discord.Interaction):
 async def quest(interaction: discord.Interaction):
     uid    = str(interaction.user.id)
     player = await get_or_create_player(uid, interaction.user.display_name)
-
     if not is_registered(player):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
     if uid in active_quests:
         q = active_quests[uid]
         await interaction.response.send_message(
-            f"You're already on **{q['title']}** — Stage {q['stage']+1}/3.\n"
+            f"Already on **{q['title']}** — Stage {q['stage']+1}/3.\n"
             "Use `/questcontinue <action>` to proceed.", ephemeral=True
         )
         return
-
     await interaction.response.defer()
     try:
         q_data = await generate_quest(cname(player), player["faction"])
@@ -1095,15 +928,11 @@ async def quest(interaction: discord.Interaction):
             "The quest board is empty right now. Try again in a moment.", ephemeral=True
         )
         return
-
     reward_val = random.randint(150, 300)
-    # persist quest to DB
     try:
         quest_id = await create_quest_db(uid, q_data["title"], q_data["stages"], reward_val)
     except Exception:
-        # if DB fails, still keep in-memory so user can continue this session
         quest_id = None
-
     active_quests[uid] = {
         "id":     quest_id,
         "title":  q_data["title"],
@@ -1111,7 +940,6 @@ async def quest(interaction: discord.Interaction):
         "stage":  0,
         "reward": reward_val,
     }
-
     stage = q_data["stages"][0]
     embed = discord.Embed(
         title=f"🗺️ {q_data['title']}",
@@ -1120,7 +948,7 @@ async def quest(interaction: discord.Interaction):
     )
     embed.add_field(name="Stage 1/3", value=stage["description"], inline=False)
     embed.add_field(name="Your move", value=stage["prompt"],       inline=False)
-    embed.add_field(name="💰 Reward", value=f"Up to {active_quests[uid]['reward']} Coin + 25 Blood", inline=False)
+    embed.add_field(name="💰 Reward", value=f"Up to {reward_val} Coin + 25 Blood", inline=False)
     embed.set_footer(text="Use /questcontinue <your action> to proceed")
     await interaction.followup.send(embed=embed)
 
@@ -1130,12 +958,10 @@ async def quest(interaction: discord.Interaction):
 async def quest_continue(interaction: discord.Interaction, action: str):
     uid    = str(interaction.user.id)
     player = await get_or_create_player(uid, interaction.user.display_name)
-
     if not is_registered(player):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
     if uid not in active_quests:
-        # try load from DB
         try:
             row = await fetch_active_quest_by_owner(uid)
             if row:
@@ -1151,44 +977,40 @@ async def quest_continue(interaction: discord.Interaction, action: str):
                 }
         except Exception:
             pass
-
     if uid not in active_quests:
         await interaction.response.send_message(
             "No active quest. Use `/quest` to begin one.", ephemeral=True
         )
         return
-
     await interaction.response.defer()
     q         = active_quests[uid]
     stage_idx = q["stage"]
     stage     = q["stages"][stage_idx]
     is_final  = (stage_idx == 2)
-
-    outcome = await generate_quest_stage_outcome(
-        q["title"], stage["description"], action, cname(player), is_final
-    )
+    try:
+        outcome = await generate_quest_stage_outcome(
+            q["title"], stage["description"], action, cname(player), is_final
+        )
+    except AIError:
+        outcome = "The situation unfolded in unexpected ways."
     q["stage"] += 1
-    # persist stage progress
     try:
         if q.get("id"):
             await update_quest_stage_db(q["id"], q["stage"])
     except Exception:
         pass
-
     if is_final:
         reward = q["reward"]
         player["coin"]  += reward
         player["blood"] += 25
         await upsert_player(uid, player)
         await add_faction_score(player.get("faction"), 20)
-        # mark complete in DB if present
         try:
             if q.get("id"):
                 await complete_quest_db(q["id"])
         except Exception:
             pass
         del active_quests[uid]
-
         embed = discord.Embed(
             title=f"✅ Quest Complete — {q['title']}",
             description=outcome,
@@ -1210,6 +1032,65 @@ async def quest_continue(interaction: discord.Interaction, action: str):
         await interaction.followup.send(embed=embed)
 
 
+@tree.command(name="contracts", description="List available Shadow Contracts")
+async def list_contracts(interaction: discord.Interaction):
+    await interaction.response.defer()
+    rows = await fetch_active_contracts()
+    if not rows:
+        await interaction.followup.send("No active contracts right now.")
+        return
+    lines = ["## 🪓 Shadow Contracts — Available"]
+    for r in rows:
+        lines.append(
+            f"**ID {r['id']}** — {r['name']}  (Difficulty {r['difficulty']})\n"
+            f"  Reward: {r['reward_coin']} Coin, {r['reward_blood']} Blood"
+        )
+    await interaction.followup.send("\n".join(lines))
+
+
+@tree.command(name="acceptcontract", description="Accept and attempt a Shadow Contract")
+@app_commands.describe(contract_id="ID of the contract to accept")
+async def accept_contract(interaction: discord.Interaction, contract_id: int):
+    uid    = str(interaction.user.id)
+    player = await get_or_create_player(uid, interaction.user.display_name)
+    if not is_registered(player):
+        await interaction.response.send_message("Use `/join` first.", ephemeral=True)
+        return
+    contract = await fetch_contract_by_id(contract_id)
+    if not contract or (
+        contract.get("expires_at") and
+        datetime.fromisoformat(str(contract["expires_at"])) <= datetime.utcnow()
+    ):
+        await interaction.response.send_message("Contract not found or expired.", ephemeral=True)
+        return
+    base         = 50
+    diff_penalty = int(contract["difficulty"]) * 6
+    blood_bonus  = min(30, player.get("blood", 0) // 5)
+    success_chance = max(10, base - diff_penalty + blood_bonus)
+    roll = random.randint(1, 100)
+    await interaction.response.defer()
+    if roll <= success_chance:
+        player["coin"]  += int(contract["reward_coin"])
+        player["blood"] += int(contract["reward_blood"])
+        await upsert_player(uid, player)
+        await add_faction_score(player.get("faction"), 10)
+        await expire_contract_db(contract_id)
+        await interaction.followup.send(
+            f"✅ Success! You completed **{contract['name']}**.\n"
+            f"Rewards: +{contract['reward_coin']} Coin, +{contract['reward_blood']} Blood"
+        )
+        await refresh_leaderboard(interaction.guild)
+    else:
+        loss = min(player.get("coin", 0), max(1, int(contract["reward_coin"]) // 3))
+        player["coin"]  = max(0, player.get("coin", 0) - loss)
+        player["blood"] = max(0, player.get("blood", 0) - max(0, int(contract["reward_blood"]) // 4))
+        await upsert_player(uid, player)
+        await expire_contract_db(contract_id)
+        await interaction.followup.send(
+            f"💀 You failed **{contract['name']}**. Lost {loss} Coin and some Blood."
+        )
+
+
 @tree.command(name="factionwar", description="View current faction war standings")
 async def faction_war(interaction: discord.Interaction):
     scores = await get_meta("faction_scores") or {f: 0 for f in FACTIONS}
@@ -1219,7 +1100,7 @@ async def faction_war(interaction: discord.Interaction):
         bar = "█" * max(1, s // 10) if s else "░"
         lines.append(f"**{f}**: {s} pts  {bar}")
     lines.append("\n**How to earn faction points:**")
-    lines.append("  Decree response: +5  •  Duel win: +15  •  Quest complete: +20  •  Steal success: +5")
+    lines.append("  Decree: +5  •  Duel win: +15  •  Quest complete: +20  •  Steal success: +5  •  Contract: +10")
     lines.append("\n*Winner announced every Monday — winning faction earns 200 Coin each.*")
     await interaction.response.send_message("\n".join(lines))
 
@@ -1233,11 +1114,9 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
     if member.id == interaction.user.id:
         await interaction.response.send_message("Can't give to yourself.", ephemeral=True)
         return
-
     uid      = str(interaction.user.id)
     giver    = await get_or_create_player(uid, interaction.user.display_name)
     receiver = await get_or_create_player(str(member.id), member.display_name)
-
     if not is_registered(giver):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
@@ -1246,12 +1125,10 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
             f"Not enough Coin. You have **{giver['coin']}**.", ephemeral=True
         )
         return
-
     giver["coin"]    -= amount
     receiver["coin"] += amount
     await upsert_player(uid, giver)
     await upsert_player(str(member.id), receiver)
-
     await interaction.response.send_message(
         f"💰 **{cname(giver)}** sends **{amount} Coin** to **{cname(receiver, member.display_name)}**."
     )
@@ -1262,15 +1139,17 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
 @app_commands.describe(moment="Describe what happened")
 async def legend(interaction: discord.Interaction, moment: str):
     await interaction.response.defer()
-    lore = await ask_ai(
-        "You are a chronicler for a Hall of Legends in a gritty fantasy Discord RP. "
-        "Transform the moment into a dramatic third-person legend (3-4 sentences). "
-        "Make it timeless and epic. No emojis.",
-        f"Submitted by {interaction.user.display_name}: {moment}"
-    )
+    try:
+        lore = await ask_ai(
+            "You are a chronicler for a Hall of Legends in a gritty fantasy Discord RP. "
+            "Transform the moment into a dramatic third-person legend (3-4 sentences). "
+            "Make it timeless and epic. No emojis.",
+            f"Submitted by {interaction.user.display_name}: {moment}"
+        )
+    except AIError:
+        lore = f"And so it was written: {moment}"
     lore_count = (await get_meta("lore_count") or 0) + 1
     await set_meta("lore_count", lore_count)
-
     embed = discord.Embed(title=f"📖 Legend #{lore_count}", description=lore, color=0xB8860B)
     embed.set_footer(text=f"Submitted by {interaction.user.display_name}")
     lore_ch = discord.utils.get(interaction.guild.text_channels, name=LORE_CHANNEL)
@@ -1290,12 +1169,14 @@ async def forcepost(interaction: discord.Interaction):
     await post_decree(interaction.guild)
     await interaction.followup.send("Decree posted.", ephemeral=True)
 
+
 @tree.command(name="forcefactionwar", description="[Admin] Resolve faction war now")
 @app_commands.checks.has_permissions(administrator=True)
 async def force_faction_war(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await resolve_faction_war(interaction.guild)
     await interaction.followup.send("Faction war resolved.", ephemeral=True)
+
 
 @tree.command(name="addcoin", description="[Admin] Add/remove Coin")
 @app_commands.describe(member="Target", amount="Amount (negative to remove)")
@@ -1310,6 +1191,23 @@ async def addcoin(interaction: discord.Interaction, member: discord.Member, amou
     )
     await refresh_leaderboard(interaction.guild)
 
+
+@tree.command(name="addcontract", description="[Admin] Create a Shadow Contract")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(name="Contract name", difficulty="1-10", reward_coin="Coin reward",
+                        reward_blood="Blood reward", expires_hours="Optional expiry in hours")
+async def add_contract(interaction: discord.Interaction, name: str, difficulty: int,
+                        reward_coin: int, reward_blood: int, expires_hours: int = None):
+    if difficulty < 1 or difficulty > 10:
+        await interaction.response.send_message("Difficulty must be 1–10.", ephemeral=True)
+        return
+    expires = None
+    if expires_hours:
+        expires = (datetime.utcnow() + timedelta(hours=expires_hours)).isoformat()
+    cid = await create_contract_db(name, difficulty, reward_coin, reward_blood, {}, expires)
+    await interaction.response.send_message(f"Contract **{name}** created (ID {cid}).", ephemeral=True)
+
+
 @tree.command(name="resetplayer", description="[Admin] Wipe a player so they can /join again")
 @app_commands.describe(member="Who to reset")
 @app_commands.checks.has_permissions(administrator=True)
@@ -1320,6 +1218,7 @@ async def resetplayer(interaction: discord.Interaction, member: discord.Member):
     active_quests.pop(uid, None)
     await interaction.response.send_message(f"{member.display_name} reset.", ephemeral=True)
 
+
 @tree.command(name="clearbounty", description="[Admin] Remove a bounty")
 @app_commands.describe(member="Who to clear")
 @app_commands.checks.has_permissions(administrator=True)
@@ -1328,6 +1227,70 @@ async def clearbounty(interaction: discord.Interaction, member: discord.Member):
     bounties.pop(str(member.id), None)
     await set_meta("bounties", bounties)
     await interaction.response.send_message("Bounty cleared.", ephemeral=True)
+
+
+# ── Scheduled tasks ───────────────────────────────────────────────────────────
+async def generate_decree() -> str:
+    players  = await load_all_players()
+    factions = list({p["faction"] for p in players.values() if p.get("faction")}) or FACTIONS
+    return await ask_ai(
+        "You are the herald of Valdris, a gritty fantasy city. Write dramatic Daily Decrees. "
+        "Each decree: 3-5 sentences, a dramatic situation + what members must DO + deadline flavour. "
+        "Tone: dark, immersive, high stakes. No emojis. Under 120 words.",
+        f"Active factions: {', '.join(factions)}. Write today's Daily Decree."
+    )
+
+async def post_decree(guild: discord.Guild) -> None:
+    ch = discord.utils.get(guild.text_channels, name=DECREE_CHANNEL)
+    if not ch:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE players SET decree_responded=FALSE")
+    try:
+        text = await generate_decree()
+    except AIError:
+        text = "The city of Valdris stirs. Seek your fortune before the night ends."
+    await set_meta("decree", {"text": text, "date": str(datetime.utcnow().date())})
+    embed = discord.Embed(title="📜 The Daily Decree", description=text, color=0x8B1A1A)
+    embed.set_footer(text="Use /decree respond <your action> before midnight to earn 50 Coin")
+    await ch.send(embed=embed)
+
+async def resolve_faction_war(guild: discord.Guild) -> None:
+    scores = await get_meta("faction_scores") or {}
+    if not any(scores.values()):
+        return
+    winner  = max(scores, key=lambda f: scores[f])
+    bonus   = 200
+    players = await load_all_players()
+    winners = []
+    for uid, p in players.items():
+        if is_registered(p) and p["faction"] == winner:
+            p["coin"] += bonus
+            await upsert_player(uid, p)
+            winners.append(cname(p))
+    await set_meta("faction_scores", {f: 0 for f in FACTIONS})
+    await set_meta("faction_week_start", str(datetime.utcnow().date()))
+    ch = discord.utils.get(guild.text_channels, name=LEADERBOARD_CHANNEL)
+    if ch and winners:
+        names = ", ".join(f"**{n}**" for n in winners)
+        await ch.send(
+            f"## ⚔️ FACTION WAR RESULTS\n"
+            f"**{winner}** dominated this week — each member earns **{bonus} Coin**!\n"
+            f"Champions: {names}\n\n*New week begins now. Fight for your faction.*"
+        )
+    await refresh_leaderboard(guild)
+
+@tasks.loop(time=time(hour=DECREE_HOUR, tzinfo=pytz.timezone(TIMEZONE)))
+async def daily_decree_task():
+    for guild in bot.guilds:
+        await post_decree(guild)
+
+@tasks.loop(time=time(hour=9, tzinfo=pytz.timezone(TIMEZONE)))
+async def weekly_faction_task():
+    now = datetime.now(pytz.timezone(TIMEZONE))
+    if now.weekday() == 0:
+        for guild in bot.guilds:
+            await resolve_faction_war(guild)
 
 
 # ── Boot ───────────────────────────────────────────────────────────────────────
