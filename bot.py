@@ -13,7 +13,7 @@ MODEL               = "meta-llama/llama-3.3-70b-instruct"
 DECREE_CHANNEL      = os.environ.get("DECREE_CHANNEL",      "daily-decree")
 LEADERBOARD_CHANNEL = os.environ.get("LEADERBOARD_CHANNEL", "leaderboard")
 LORE_CHANNEL        = os.environ.get("LORE_CHANNEL",        "hall-of-legends")
-DECREE_HOUR         = int(os.environ.get("DECREE_HOUR", "9"))
+DECREE_HOUR         = int(os.environ.get("DECREE_HOUR", "21"))
 TIMEZONE            = os.environ.get("TIMEZONE", "Asia/Kolkata")
 FACTIONS            = ["Shadow Hand", "Iron Crown", "The Unmarked"]
 
@@ -66,6 +66,32 @@ async def init_db():
                 "INSERT INTO meta (key, value) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                 k, v
             )
+        # Ensure quests and contracts tables exist (runtime safety)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS quests (
+                id SERIAL PRIMARY KEY,
+                owner_uid TEXT,
+                title TEXT NOT NULL,
+                stages JSONB NOT NULL,
+                current_stage INTEGER NOT NULL DEFAULT 0,
+                reward INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS contracts (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                difficulty INTEGER NOT NULL,
+                reward_coin INTEGER NOT NULL,
+                reward_blood INTEGER NOT NULL,
+                metadata JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NULL
+            )
+        """)
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
@@ -140,6 +166,65 @@ async def get_or_create_player(uid: str, username: str) -> dict:
             p["username"] = username
             await upsert_player(uid, p)
     return p
+
+
+# ── Quest & Contract DB helpers ───────────────────────────────────────────────
+async def create_quest_db(owner_uid: str | None, title: str, stages: list, reward: int, expires_at: str | None = None) -> int:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO quests (owner_uid, title, stages, reward, expires_at) VALUES ($1,$2,$3,$4,$5) RETURNING id",
+            owner_uid, title, json.dumps(stages), reward, expires_at
+        )
+    return row["id"]
+
+async def fetch_active_quest_by_owner(owner_uid: str) -> dict | None:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM quests WHERE owner_uid=$1 AND status='active'", owner_uid)
+    return dict(row) if row else None
+
+async def fetch_active_board_quests(limit: int = 10) -> list[dict]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM quests WHERE owner_uid IS NULL AND status='active' ORDER BY created_at DESC LIMIT $1", limit)
+    return [dict(r) for r in rows]
+
+async def update_quest_stage_db(quest_id: int, new_stage: int) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE quests SET current_stage=$1 WHERE id=$2", new_stage, quest_id)
+
+async def complete_quest_db(quest_id: int) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE quests SET status='completed' WHERE id=$1", quest_id)
+
+
+async def create_contract_db(name: str, difficulty: int, reward_coin: int, reward_blood: int, metadata: dict | None = None, expires_at: str | None = None) -> int:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO contracts (name, difficulty, reward_coin, reward_blood, metadata, expires_at) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+            name, difficulty, reward_coin, reward_blood, json.dumps(metadata or {}), expires_at
+        )
+    return row["id"]
+
+async def fetch_contract_by_id(contract_id: int) -> dict | None:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM contracts WHERE id=$1", contract_id)
+    return dict(row) if row else None
+
+async def load_active_quests_from_db() -> None:
+    """Load active personal quests into in-memory cache on startup (optional)."""
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM quests WHERE status='active' AND owner_uid IS NOT NULL")
+        for r in rows:
+            active_quests[r["owner_uid"]] = {
+                "id": r["id"],
+                "title": r["title"],
+                "stages": r["stages"],
+                "stage": r["current_stage"],
+                "reward": r["reward"],
+            }
+    except Exception:
+        # tolerate errors at startup — DB may be unavailable during migrations
+        pass
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -933,11 +1018,20 @@ async def quest(interaction: discord.Interaction):
         )
         return
 
+    reward_val = random.randint(150, 300)
+    # persist quest to DB
+    try:
+        quest_id = await create_quest_db(uid, q_data["title"], q_data["stages"], reward_val)
+    except Exception:
+        # if DB fails, still keep in-memory so user can continue this session
+        quest_id = None
+
     active_quests[uid] = {
+        "id":     quest_id,
         "title":  q_data["title"],
         "stages": q_data["stages"],
         "stage":  0,
-        "reward": random.randint(150, 300),
+        "reward": reward_val,
     }
 
     stage = q_data["stages"][0]
@@ -963,6 +1057,24 @@ async def quest_continue(interaction: discord.Interaction, action: str):
         await interaction.response.send_message("Use `/join` first.", ephemeral=True)
         return
     if uid not in active_quests:
+        # try load from DB
+        try:
+            row = await fetch_active_quest_by_owner(uid)
+            if row:
+                stages = row["stages"]
+                if isinstance(stages, str):
+                    stages = json.loads(stages)
+                active_quests[uid] = {
+                    "id":     row["id"],
+                    "title":  row["title"],
+                    "stages": stages,
+                    "stage":  row["current_stage"],
+                    "reward": row["reward"],
+                }
+        except Exception:
+            pass
+
+    if uid not in active_quests:
         await interaction.response.send_message(
             "No active quest. Use `/quest` to begin one.", ephemeral=True
         )
@@ -978,6 +1090,12 @@ async def quest_continue(interaction: discord.Interaction, action: str):
         q["title"], stage["description"], action, cname(player), is_final
     )
     q["stage"] += 1
+    # persist stage progress
+    try:
+        if q.get("id"):
+            await update_quest_stage_db(q["id"], q["stage"])
+    except Exception:
+        pass
 
     if is_final:
         reward = q["reward"]
@@ -985,6 +1103,12 @@ async def quest_continue(interaction: discord.Interaction, action: str):
         player["blood"] += 25
         await upsert_player(uid, player)
         await add_faction_score(player.get("faction"), 20)
+        # mark complete in DB if present
+        try:
+            if q.get("id"):
+                await complete_quest_db(q["id"])
+        except Exception:
+            pass
         del active_quests[uid]
 
         embed = discord.Embed(
@@ -1132,6 +1256,7 @@ async def clearbounty(interaction: discord.Interaction, member: discord.Member):
 @bot.event
 async def on_ready():
     await init_db()
+    await load_active_quests_from_db()
     await tree.sync()
     if not daily_decree_task.is_running():
         daily_decree_task.start()
