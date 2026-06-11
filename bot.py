@@ -227,6 +227,84 @@ async def load_active_quests_from_db() -> None:
         pass
 
 
+# ── Contracts helpers & commands ─────────────────────────────────────────────
+async def fetch_active_contracts(limit: int = 10) -> list[dict]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM contracts WHERE expires_at IS NULL OR expires_at > now() ORDER BY created_at DESC LIMIT $1", limit)
+    return [dict(r) for r in rows]
+
+async def expire_contract_db(contract_id: int) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE contracts SET expires_at = now() WHERE id=$1", contract_id)
+
+
+@tree.command(name="contracts", description="List available Shadow Contracts")
+async def list_contracts(interaction: discord.Interaction):
+    await interaction.response.defer()
+    rows = await fetch_active_contracts()
+    if not rows:
+        await interaction.followup.send("No active contracts right now.")
+        return
+    lines = ["## 🪓 Shadow Contracts — Available" ]
+    for r in rows:
+        lines.append(f"**ID {r['id']}** — {r['name']}  (Difficulty {r['difficulty']})\n  Reward: {r['reward_coin']} Coin, {r['reward_blood']} Blood")
+    await interaction.followup.send("\n".join(lines))
+
+
+@tree.command(name="addcontract", description="[Admin] Create a Shadow Contract")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(name="Contract name", difficulty="1-5", reward_coin="Coin reward", reward_blood="Blood reward", expires_hours="Optional expiry in hours")
+async def add_contract(interaction: discord.Interaction, name: str, difficulty: int, reward_coin: int, reward_blood: int, expires_hours: int = None):
+    if difficulty < 1 or difficulty > 10:
+        await interaction.response.send_message("Difficulty must be between 1 and 10.", ephemeral=True)
+        return
+    expires = None
+    if expires_hours:
+        expires = (datetime.utcnow() + timedelta(hours=expires_hours)).isoformat()
+    cid = await create_contract_db(name, difficulty, reward_coin, reward_blood, {}, expires)
+    await interaction.response.send_message(f"Contract created (ID {cid}).", ephemeral=True)
+
+
+@tree.command(name="acceptcontract", description="Accept and attempt a Shadow Contract")
+@app_commands.describe(contract_id="ID of the contract to accept")
+async def accept_contract(interaction: discord.Interaction, contract_id: int):
+    uid = str(interaction.user.id)
+    player = await get_or_create_player(uid, interaction.user.display_name)
+    if not is_registered(player):
+        await interaction.response.send_message("Use `/join` first.", ephemeral=True)
+        return
+    contract = await fetch_contract_by_id(contract_id)
+    if not contract or (contract.get('expires_at') and datetime.fromisoformat(contract['expires_at']) <= datetime.utcnow()):
+        await interaction.response.send_message("Contract not found or expired.", ephemeral=True)
+        return
+
+    # Compute success chance: base 50% modified by difficulty and player's blood
+    base = 50
+    diff_penalty = int(contract['difficulty']) * 6  # bigger difficulty reduces chance
+    blood_bonus = min(30, player.get('blood', 0) // 5)
+    success_chance = max(10, base - diff_penalty + blood_bonus)
+
+    roll = random.randint(1, 100)
+    await interaction.response.defer()
+    if roll <= success_chance:
+        # success
+        player['coin'] += int(contract['reward_coin'])
+        player['blood'] += int(contract['reward_blood'])
+        await upsert_player(uid, player)
+        await add_faction_score(player.get('faction'), 10)
+        await expire_contract_db(contract_id)
+        await interaction.followup.send(f"✅ Success! You completed **{contract['name']}**. Rewards: +{contract['reward_coin']} Coin, +{contract['reward_blood']} Blood")
+        await refresh_leaderboard(interaction.guild)
+    else:
+        # failure penalty
+        loss = min(player.get('coin', 0), max(1, int(contract['reward_coin']) // 3))
+        player['coin'] = max(0, player.get('coin', 0) - loss)
+        player['blood'] = max(0, player.get('blood', 0) - max(0, int(contract['reward_blood']) // 4))
+        await upsert_player(uid, player)
+        await expire_contract_db(contract_id)
+        await interaction.followup.send(f"💀 You failed **{contract['name']}**. You lost {loss} Coin and some Blood.")
+
+
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 def is_registered(p: dict) -> bool:
     return bool(p.get("character") and p.get("faction"))
