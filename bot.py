@@ -85,6 +85,9 @@ def add_faction_score(data: dict, faction: str | None, pts: int) -> None:
 
 
 # ── AI helper ─────────────────────────────────────────────────────────────────
+class AIError(Exception):
+    pass
+
 async def ask_ai(system: str, user: str, max_tokens: int = 400) -> str:
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
@@ -96,13 +99,24 @@ async def ask_ai(system: str, user: str, max_tokens: int = 400) -> str:
         "messages": [{"role": "system", "content": system},
                      {"role": "user",   "content": user}],
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers, json=payload,
-        ) as resp:
-            result = await resp.json()
-            return result["choices"][0]["message"]["content"].strip()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers, json=payload,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    raise AIError(f"API returned {resp.status}")
+                result = await resp.json()
+                content = result.get("choices", [{}])[0].get("message", {}).get("content")
+                if not content:
+                    raise AIError("Empty response from AI")
+                return content.strip()
+    except AIError:
+        raise
+    except Exception as e:
+        raise AIError(f"AI request failed: {e}") from e
 
 
 # ── Bot setup ──────────────────────────────────────────────────────────────────
@@ -314,14 +328,17 @@ class DefenderMoveView(discord.ui.View):
 
         save_data(data)
 
-        narrative = await ask_ai(
-            "You are a battle chronicler for a gritty fantasy Discord RP. "
-            "Write 3 dramatic sentences describing a duel based on the moves used. "
-            "Make it feel cinematic. No emojis. No 'Winner:' line.",
-            f"{c_name} (Blood {challenger['blood']}) used {c_move}.\n"
-            f"{d_name} (Blood {defender['blood']}) used {d_move}.\n"
-            f"{winner_name} wins. Narrate the fight."
-        )
+        try:
+            narrative = await ask_ai(
+                "You are a battle chronicler for a gritty fantasy Discord RP. "
+                "Write 3 dramatic sentences describing a duel based on the moves used. "
+                "Make it feel cinematic. No emojis. No 'Winner:' line.",
+                f"{c_name} (Blood {challenger['blood']}) used {c_move}.\n"
+                f"{d_name} (Blood {defender['blood']}) used {d_move}.\n"
+                f"{winner_name} wins. Narrate the fight."
+            )
+        except AIError:
+            narrative = f"The clash was fierce and decisive. {winner_name} emerged victorious."
 
         await interaction.channel.send(
             f"## ⚔️ DUEL RESOLVED\n<@{c_uid}> vs {interaction.user.mention}\n\n"
@@ -431,8 +448,31 @@ async def generate_quest(character: str, faction: str) -> dict:
         max_tokens=600
     )
     # Strip possible markdown fences
-    raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-    return json.loads(raw)
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise AIError(f"Quest JSON invalid: {e}") from e
+
+    # Validate required structure
+    if not isinstance(data.get("title"), str):
+        raise AIError("Quest missing title")
+    if not isinstance(data.get("intro"), str):
+        raise AIError("Quest missing intro")
+    stages = data.get("stages", [])
+    if len(stages) != 3 or not all(
+        isinstance(s.get("description"), str) and isinstance(s.get("prompt"), str)
+        for s in stages
+    ):
+        raise AIError("Quest stages malformed")
+
+    return data
 
 async def generate_quest_stage_outcome(quest_title: str, stage_desc: str,
                                         action: str, character: str, is_final: bool) -> str:
@@ -523,11 +563,14 @@ async def decree_respond(interaction: discord.Interaction, action: str):
         return
 
     await interaction.response.defer()
-    outcome = await ask_ai(
-        "You are a dramatic fantasy narrator. A player responded to today's event. "
-        "Write ONE cinematic sentence (max 20 words) describing the outcome. No emojis.",
-        f"Decree: {data['decree']['text']}\n{player['character']} does: {action}"
-    )
+    try:
+        outcome = await ask_ai(
+            "You are a dramatic fantasy narrator. A player responded to today's event. "
+            "Write ONE cinematic sentence (max 20 words) describing the outcome. No emojis.",
+            f"Decree: {data['decree']['text']}\n{player['character']} does: {action}"
+        )
+    except AIError:
+        outcome = f"{player['character']} answered the call and made their mark on the city."
 
     player["coin"]  += 50
     player["blood"] += 10
@@ -646,10 +689,13 @@ async def steal(interaction: discord.Interaction, target: discord.Member):
 
     save_data(data)
 
-    narrative = await ask_ai(
-        "You are a gritty fantasy narrator for a Discord RP. Be dramatic and brief.",
-        outcome_prompt
-    )
+    try:
+        narrative = await ask_ai(
+            "You are a gritty fantasy narrator for a Discord RP. Be dramatic and brief.",
+            outcome_prompt
+        )
+    except AIError:
+        narrative = "The streets of Valdris never forget what happened next." if success else "The guards were watching. A costly mistake."
 
     if success:
         await interaction.followup.send(
@@ -714,11 +760,14 @@ async def gamble(interaction: discord.Interaction, amount: int):
 
     save_data(data)
 
-    narrative = await ask_ai(
-        "You are narrating a tense gambling scene in a gritty fantasy tavern called The Rusty Crown. "
-        "Write ONE sentence about the dice roll outcome. Dramatic, no emojis.",
-        f"Player: {cname(player)}. Bet: {amount} Coin. {'Won' if won else 'Lost'}."
-    )
+    try:
+        narrative = await ask_ai(
+            "You are narrating a tense gambling scene in a gritty fantasy tavern called The Rusty Crown. "
+            "Write ONE sentence about the dice roll outcome. Dramatic, no emojis.",
+            f"Player: {cname(player)}. Bet: {amount} Coin. {'Won' if won else 'Lost'}."
+        )
+    except AIError:
+        narrative = "The dice rolled. Fate decided." 
 
     embed = discord.Embed(
         title=f"🎰 {'WINNER!' if won else 'BUST!'}",
