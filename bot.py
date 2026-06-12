@@ -327,6 +327,17 @@ async def expire_contract_db(contract_id):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE contracts SET expires_at = now() WHERE id=$1", contract_id)
 
+async def delete_contract_db(contract_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM contracts WHERE id=$1", contract_id)
+
+async def fetch_all_contracts(limit=50):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM contracts ORDER BY created_at DESC LIMIT $1", limit
+        )
+    return [dict(r) for r in rows]
+
 
 # ── Faction Mission DB helpers ────────────────────────────────────────────────
 async def create_faction_mission_db(guild_id, faction, title, description, goal,
@@ -1925,6 +1936,57 @@ async def add_contract(interaction, name: str, difficulty: int,
         expires = (datetime.utcnow() + timedelta(hours=expires_hours)).isoformat()
     cid = await create_contract_db(name, difficulty, reward_coin, reward_blood, {}, expires)
     await interaction.response.send_message(f"Contract **{name}** created (ID {cid}).", ephemeral=True)
+
+
+@tree.command(name="deletecontract", description="[Admin] Delete a Shadow Contract")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(contract_id="ID of the contract to delete")
+async def delete_contract(interaction, contract_id: int):
+    contract = await fetch_contract_by_id(contract_id)
+    if not contract:
+        await interaction.response.send_message("Contract not found.", ephemeral=True)
+        return
+
+    await delete_contract_db(contract_id)
+    await interaction.response.send_message(
+        f"Contract **{contract['name']}** (ID {contract_id}) deleted.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="expirecontract", description="[Admin] Expire a Shadow Contract")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(contract_id="ID of the contract to expire")
+async def expire_contract(interaction, contract_id: int):
+    contract = await fetch_contract_by_id(contract_id)
+    if not contract:
+        await interaction.response.send_message("Contract not found.", ephemeral=True)
+        return
+
+    await expire_contract_db(contract_id)
+    await interaction.response.send_message(
+        f"Contract **{contract['name']}** (ID {contract_id}) expired.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="contractsadmin", description="[Admin] List all Shadow Contracts")
+@app_commands.checks.has_permissions(administrator=True)
+async def contracts_admin(interaction):
+    rows = await fetch_all_contracts()
+    if not rows:
+        await interaction.response.send_message("No contracts found.", ephemeral=True)
+        return
+
+    lines = ["## 🪓 Shadow Contracts — Admin View"]
+    for r in rows:
+        expires = r['expires_at'] if r['expires_at'] else 'Never'
+        status = 'Active' if not r['expires_at'] or datetime.fromisoformat(str(r['expires_at'])) > datetime.utcnow() else 'Expired'
+        lines.append(
+            f"**ID {r['id']}** — {r['name']} (Difficulty {r['difficulty']})\n"
+            f"  Reward: {r['reward_coin']} Coin, {r['reward_blood']} Blood  •  {status}  •  Expires: {expires}"
+        )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @tree.command(name="postfactionmission", description="[Admin] Post a faction mission")
